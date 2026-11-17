@@ -1,0 +1,30 @@
+static const uint TILE_SIZE = 32;
+
+[shader("compute")]
+[numthreads(TILE_SIZE * TILE_SIZE, 1, 1)]
+void gemm(
+    uint3 thread_idx: SV_GroupThreadID,
+    uint3 block_idx: SV_GroupID,
+    
+    uniform float* A,
+    uniform float* B,
+    uniform float* C,
+    uniform uint M,
+    uniform uint N,
+    uniform uint K,
+    uniform float alpha,
+    uniform float beta,
+) {
+    const uint x = block_idx.x * TILE_SIZE + (thread_idx.x / TILE_SIZE);
+    const uint y = block_idx.y * TILE_SIZE + (thread_idx.x % TILE_SIZE);
+
+    if (x < M && y < N) {
+        float tmp = 0.0;
+
+        for (uint i = 0; i < K; ++i) {
+            tmp += A[x * K + i] * B[i * N + y];
+        }
+
+        C[x * N + y] = alpha * tmp + beta * C[x * N + y];
+    }
+}
