@@ -27,7 +27,7 @@ impl GemmKernel for Tile2DKernel {
     }
 
     fn groups(&self, m: u32, n: u32, _k: u32) -> (u32, u32, u32) {
-        (m.div_ceil(64), n.div_ceil(64), 1)
+        (m.div_ceil(32), n.div_ceil(32), 1)
     }
 
     fn launch(

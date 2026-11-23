@@ -2,6 +2,7 @@
 mod cache_block;
 #[path = "02_coalesced.rs"]
 mod coalesced;
+mod intel;
 #[path = "01_naive.rs"]
 mod naive;
 #[path = "04_tile1d.rs"]
@@ -13,6 +14,7 @@ mod vected;
 
 pub use cache_block::*;
 pub use coalesced::*;
+pub use intel::*;
 pub use naive::*;
 pub use tile1d::*;
 pub use tile2d::*;

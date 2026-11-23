@@ -1,200 +1,149 @@
-import lib.matrix;
-
 // --------------------------------
 // Per workgroup (or tile)
 static const uint BN = 64;
 static const uint BM = 64;
 static const uint BK = 16;
-
+static const uint BN_VEC = BN / 4;
+static const uint BM_VEC = BM / 4;
+static const uint BK_VEC = BK / 4;
 // Per thread
 static const uint TM = 8;
 static const uint TN = 4;
-
-// Subgroup width
-static const uint WAVE_SIZE = 8;
-
-// Derived constants
-static const uint NUM_THREADS = (BM * BN) / (TM * TN);
-static const uint BK_VEC = BK / 4;
-static const uint BN_VEC = BN / 4;
 static const uint TN_VEC = TN / 4;
-static const uint THREADS_PER_ROW = BN / TN;
-static const uint GROUP_LANES = (THREADS_PER_ROW < WAVE_SIZE) ? THREADS_PER_ROW : WAVE_SIZE;
-static const uint A_CHUNKS = (TM + GROUP_LANES - 1) / GROUP_LANES;
+// Total thread count
+static const uint NUM_THREADS = (BM * BN) / (TM * TN);
 
-static const uint JUMP_A = NUM_THREADS / BK_VEC;
-static const uint JUMP_B = NUM_THREADS / BN_VEC;
-static const uint PREF_A = BM / JUMP_A;
-static const uint PREF_B = BK / JUMP_B;
+groupshared float4 As[BM][BK_VEC + 1];
+groupshared float4 Bs[BK][BN_VEC + 1];
 
-// L3 Cache Swizzling
-static const uint GROUP_M = 8;
-
-groupshared float4 As[2][BM][BK_VEC];
-groupshared float4 Bs[2][BK][BN_VEC];
+// Explicit descriptor bindings (Set 0)
+[[vk::binding(0, 0)]] StructuredBuffer<float4> A;
+[[vk::binding(1, 0)]] StructuredBuffer<float4> B;
+[[vk::binding(2, 0)]] RWStructuredBuffer<float4> C;
 
 // --------------------------------
 
 [shader("compute")]
-[WaveSize(WAVE_SIZE)]
 [numthreads(NUM_THREADS, 1, 1)]
 void gemm(
     uint3 thread_idx: SV_GroupThreadID,
     uint3 block_idx: SV_GroupID,
 
-    uniform float4 *A,
-    uniform float4 *B,
-    uniform float4 *C,
     uniform uint M,
     uniform uint N,
     uniform uint K,
     uniform float alpha,
     uniform float beta,
 ) {
-    // Wrap it into Mat structs for my fucking convenience - it is row major so let's be careful.
-    let A_full = GlobalMat4(A, K >> 2);
-    let B_full = GlobalMat4(B, N >> 2);
-    let C_full = GlobalMat4(C, N >> 2);         // Now uses float4 aligned matrices
-
-    // Swizzling for L3 cache       - (num_tiles_n, num_tiles_m, 1)
-    uint tile_m, tile_n4;
-    {
-        let num_tiles_m  = (M + BM - 1) / BM;
-        let num_tiles_n  = (N + BN - 1) / BN;
-        let linear_id    = block_idx.y * num_tiles_n + block_idx.x;
-        let width        = num_tiles_n * GROUP_M;
-        let group_id     = linear_id / width;
-        let first_tile_m = group_id * GROUP_M;
-        let group_size_m = min(num_tiles_m - first_tile_m, GROUP_M);
+    let K_vec = K / 4;
+    let N_vec = N / 4;
     
-        tile_m = (first_tile_m + (linear_id % group_size_m)) * BM;
-        tile_n4 = (((linear_id % width) / group_size_m) * BN) >> 2;
-    }
-
-    // Now setup some coordinates
-    let thread_row = thread_idx.x / (BN / TN);  // Coalesced access of GMEM in workgroup
+    // Setup some coordinates
+    let c_row = block_idx.y;             // Tile coordinate from block
+    let c_col = block_idx.x;
+    let thread_row = thread_idx.x / (BN / TN); // Coalesced access of GMEM in workgroup
     let thread_col = thread_idx.x % (BN / TN);
-    
-    let lane = WaveGetLaneIndex();
-    let lane_base = (lane / GROUP_LANES) * GROUP_LANES;
-    let lane_off  = lane % GROUP_LANES;
 
+    // Inner loading coordinates
     let inner_col_a = thread_idx.x % BK_VEC;
     let inner_row_a = thread_idx.x / BK_VEC;
+    
     let inner_col_b = thread_idx.x % BN_VEC;
     let inner_row_b = thread_idx.x / BN_VEC;
-
+    
     let jump_a = NUM_THREADS / BK_VEC;
     let jump_b = NUM_THREADS / BN_VEC;
 
     // Registers per thread
-    float4 thread_results[TM][TN_VEC] = {};
-
-    let A_base = A_full.shift(tile_m, 0);
-    let B_base = B_full.shift(0, tile_n4);
-
-    // ----
-    {
-        [unroll]
-        for (uint i = 0; i < PREF_A; ++i) {
-            let r = i * JUMP_A + inner_row_a;
-            As[0][r][inner_col_a] = A_base.load4(r, inner_col_a);
-        }
-        [unroll]
-        for (uint i = 0; i < PREF_B; ++i) {
-            let r = i * JUMP_B + inner_row_b;
-            Bs[0][r][inner_col_b] = B_base.load4(r, inner_col_b);
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    uint stage = 0;
+    float thread_results[TM * TN] = { 0.0 };
 
     for (uint k = 0; k < K; k += BK) {
-        float4 pref_a[PREF_A] = {};
-        float4 pref_b[PREF_B] = {};
-
-        let has_next = (k + BK < K);
-        if (has_next) {
-            let A_tile = A_base.shift(0, (k + BK) >> 2);
-            let B_tile = B_base.shift(k + BK, 0);
-
-            [unroll]
-            for (uint i = 0; i < PREF_A; ++i) {
-                pref_a[i] = A_tile.load4(i * JUMP_A + inner_row_a, inner_col_a);
-            }
-            [unroll]
-            for (uint i = 0; i < PREF_B; ++i) {
-                pref_b[i] = B_tile.load4(i * JUMP_B + inner_row_b, inner_col_b);
-            }
+        // Load tiles into groupshared memory.
+        [unroll]
+        for (uint off = 0; off < BM; off += jump_a) {
+            let global_row_a = (c_row * BM) + inner_row_a + off;
+            let global_col_a = (k / 4) + inner_col_a;
+            As[inner_row_a + off][inner_col_a] = A[global_row_a * K_vec + global_col_a];
         }
+        [unroll]
+        for (uint off = 0; off < BK; off += jump_b) {
+            let global_row_b = k + inner_row_b + off;
+            let global_col_b = (c_col * BN_VEC) + inner_col_b;
+            Bs[inner_row_b + off][inner_col_b] = B[global_row_b * N_vec + global_col_b];
+        }
+
+        GroupMemoryBarrierWithGroupSync();
 
         [loop]
         for (uint dv = 0; dv < BK_VEC; ++dv) {
-            float4 a_local[A_CHUNKS];
-            
+            // As -> reg_m
+            float4 reg_m[TM];
             [unroll]
-            for (uint c = 0; c < A_CHUNKS; ++c) {
-                uint m_idx = min(c * GROUP_LANES + lane_off, TM - 1);
-                a_local[c] = As[stage][thread_row * TM + m_idx][dv];
+            for (uint m = 0; m < TM; ++m) {
+                reg_m[m] = As[thread_row * TM + m][dv];
             }
 
+            // Transpose As in reg_m, use unroll for compile-time optimization
+            // We intend to make this command into register swizzling
             [unroll]
-            for (uint i = 0; i < 4; ++i) {
-                float4 reg_b[TN_VEC];
+            for (uint sub = 0; sub < 4; ++sub) {
+                uint d = dv * 4 + sub;
+
                 [unroll]
                 for (uint nv = 0; nv < TN_VEC; ++nv) {
-                    reg_b[nv] = Bs[stage][dv * 4 + i][thread_col * TN_VEC + nv];
-                }
-
-                [unroll]
-                for (uint m = 0; m < TM; ++m) {
-                    let a_m = WaveReadLaneAt(
-                        a_local[m / GROUP_LANES],
-                        lane_base + (m % GROUP_LANES)
-                    );
+                    float4 reg_n = Bs[d][thread_col * TN_VEC + nv];
 
                     [unroll]
-                    for (uint nv = 0; nv < TN_VEC; ++nv) {
-                        thread_results[m][nv] = fma(float4(a_m[i]), reg_b[nv], thread_results[m][nv]);
+                    for (uint m = 0; m < TM; ++m) {
+                        uint res_base = m * TN + nv * 4;
+                        float a_val = reg_m[m][sub];
+
+                        thread_results[res_base + 0] = fma(a_val, reg_n.x, thread_results[res_base + 0]);
+                        thread_results[res_base + 1] = fma(a_val, reg_n.y, thread_results[res_base + 1]);
+                        thread_results[res_base + 2] = fma(a_val, reg_n.z, thread_results[res_base + 2]);
+                        thread_results[res_base + 3] = fma(a_val, reg_n.w, thread_results[res_base + 3]);
                     }
                 }
             }
         }
 
-        if (has_next) {
-            uint next_stage = stage ^ 1;
-            [unroll]
-            for (uint i = 0; i < PREF_A; ++i) {
-                As[next_stage][i * JUMP_A + inner_row_a][inner_col_a] = pref_a[i];
-            }
-            [unroll]
-            for (uint i = 0; i < PREF_B; ++i) {
-                Bs[next_stage][i * JUMP_B + inner_row_b][inner_col_b] = pref_b[i];
-            }
-
-            GroupMemoryBarrierWithGroupSync();
-            stage = next_stage;
-        }
+        GroupMemoryBarrierWithGroupSync();
     }
 
-    // Get C tile view
-    var C_tile = C_full.shift(tile_m, tile_n4);
-
     // Write to C tile
-    [unroll]
-    for (uint m = 0; m < TM; ++m) {
-        let r = thread_row * TM + m;
-
+    if (beta == 0.0) {
         [unroll]
-        for (uint nv = 0; nv < TN_VEC; ++nv) {
-            let c4 = thread_col * TN_VEC + nv;
-
-            if (beta == 0.0) {
-                C_tile.store4(r, c4, alpha * thread_results[m][nv]);
-            } else {
-                float4 oldC = C_tile.load4(r, c4);
-                C_tile.store4(r, c4, alpha * thread_results[m][nv] + beta * oldC);
+        for (uint m = 0; m < TM; ++m) {
+            let r = c_row * BM + thread_row * TM + m;
+            [unroll]
+            for (uint nv = 0; nv < TN_VEC; ++nv) {
+                let cv = c_col * BN_VEC + thread_col * TN_VEC + nv;
+                let res_idx = m * TN + nv * 4;
+                float4 res_vec = float4(
+                    thread_results[res_idx + 0],
+                    thread_results[res_idx + 1],
+                    thread_results[res_idx + 2],
+                    thread_results[res_idx + 3]
+                );
+                C[r * N_vec + cv] = alpha * res_vec;
+            }
+        }
+    } else {
+        [unroll]
+        for (uint m = 0; m < TM; ++m) {
+            let r = c_row * BM + thread_row * TM + m;
+            [unroll]
+            for (uint nv = 0; nv < TN_VEC; ++nv) {
+                let cv = c_col * BN_VEC + thread_col * TN_VEC + nv;
+                let res_idx = m * TN + nv * 4;
+                float4 res_vec = float4(
+                    thread_results[res_idx + 0],
+                    thread_results[res_idx + 1],
+                    thread_results[res_idx + 2],
+                    thread_results[res_idx + 3]
+                );
+                let c_idx = r * N_vec + cv;
+                C[c_idx] = fma(float4(alpha), res_vec, beta * C[c_idx]);
             }
         }
     }

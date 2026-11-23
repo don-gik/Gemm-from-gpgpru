@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive"] }
-gpgpru = "0.3.4"
+anyhow = "1.0.105"
+clap = { version = "4.6.9", features = ["derive"] }
+gpgpru = "0.4.1"
 indicatif = "0.18.6"

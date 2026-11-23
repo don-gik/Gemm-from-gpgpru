@@ -1,10 +1,10 @@
 use super::*;
 
 #[kernel("src/kernels/06_vected.slang", "gemm", profiles = [SpvGroupNonUniform, SpvGroupNonUniformShuffle])]
-fn tile2d_slang(
-    A: &GpuSlice<f32>,
-    B: &GpuSlice<f32>,
-    C: &mut GpuSlice<f32>,
+fn vected_slang(
+    #[raw] A: &GpuSlice<f32>,
+    #[raw] B: &GpuSlice<f32>,
+    #[raw] C: &mut GpuSlice<f32>,
     M: u32,
     N: u32,
     K: u32,
@@ -43,7 +43,7 @@ impl GemmKernel for VectedKernel {
         beta: f32,
     ) -> Result<()> {
         let groups = self.groups(m, n, k);
-        tile2d_slang(buf_a, buf_b, buf_c, m, n, k, alpha, beta).queue(device, groups)?;
+        vected_slang(buf_a, buf_b, buf_c, m, n, k, alpha, beta).queue(device, groups)?;
         Ok(())
     }
 }

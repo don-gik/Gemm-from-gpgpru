@@ -35,6 +35,8 @@ enum Commands {
     Tile2d,
     /// Run a vectorized access tiled kernel.
     Vected,
+    /// Run a tuned kernel for Intel Iris Xe.
+    Intel,
 }
 
 fn main() -> Result<()> {
@@ -51,6 +53,7 @@ fn main() -> Result<()> {
         Commands::Tile1d => bench.run(&Tile1DKernel::new())?,
         Commands::Tile2d => bench.run(&Tile2DKernel::new())?,
         Commands::Vected => bench.run(&VectedKernel::new())?,
+        Commands::Intel => bench.run(&IntelKernel::new())?,
     }
 
     Ok(())

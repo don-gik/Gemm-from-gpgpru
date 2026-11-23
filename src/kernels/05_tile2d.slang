@@ -1,15 +1,11 @@
-// I'm fucking stressed reading spaghetti CUDA codes so for now I'LL USE STRUCTS
-
-import lib.matrix;
-
 // --------------------------------
 // Per workgroup (or tile)
-static const uint BN = 64;
-static const uint BM = 64;
+static const uint BN = 32;
+static const uint BM = 32;
 static const uint BK = 8;
 // Per thread
 static const uint TM = 4;
-static const uint TN = 4;
+static const uint TN = 2;
 // Total thread count
 static const uint NUM_THREADS = (BM * BN) / (TM * TN);
 
@@ -33,12 +29,7 @@ void gemm(
     uniform float alpha,
     uniform float beta,
 ) {
-    // Wrap it into Mat structs for my fucking convenience - it is row major so let's be careful.
-    let A_full = GlobalMat(A, K);       // A: M x K
-    let B_full = GlobalMat(B, N);       // B: K x N
-    let C_full = GlobalMat(C, N);       // C: M x N
-
-    // Now setup some coordinates
+    // Setup some coordinates
     let c_row = block_idx.y;             // Tile coordinate from block
     let c_col = block_idx.x;
     let thread_row = thread_idx.x / (BN / TN); // Coalesced access of GMEM in workgroup
@@ -54,36 +45,50 @@ void gemm(
     let jump_a = NUM_THREADS / BK;
     let jump_b = NUM_THREADS / BN;
 
-    // Get view for tile C
-    var C_tile = C_full.shift(c_row * BM, c_col * BN);
-
     // Registers per thread
     float thread_results[TM * TN] = { 0.0 };
-    float reg_m[TM], reg_n[TN];
 
     for (uint k = 0; k < K; k += BK) {
         // Get view for this tile - iterates over A & B.
-        let A_tile = A_full.shift(c_row * BM, k);
-        let B_tile = B_full.shift(k, c_col * BN);
+        let tile_a = c_row * BM * M + k;
+        let B_tile = c_col * BN * K + k;
 
         // Load tiles into groupshared memory.
+        [unroll]
         for (uint off = 0; off < BM; off += jump_a) {
-            As[inner_row_a + off][inner_col_a] = A_tile[inner_row_a + off, inner_col_a];
+            let global_row_a = (c_row * BM) + inner_row_a + off;
+            let global_col_a = k + inner_col_a;
+            
+            As[inner_row_a + off][inner_col_a] = 
+                A[global_row_a * K + global_col_a];
         }
+        [unroll]
         for (uint off = 0; off < BK; off += jump_b) {
-            Bs[inner_row_b + off][inner_col_b] = B_tile[inner_row_b + off, inner_col_b];
+            let global_row_b = k + inner_row_b + off;
+            let global_col_b = (c_col * BN) + inner_col_b;
+
+            Bs[inner_row_b + off][inner_col_b] = 
+                B[global_row_b * N + global_col_b];
         }
 
         GroupMemoryBarrierWithGroupSync();
 
+        [loop]
         for (uint d = 0; d < BK; ++d) {
+            float reg_m[TM] = { 0.0 };
+            float reg_n[TN] = { 0.0 };
+
+            [unroll]
             for (uint i = 0; i < TM; ++i) {
                 reg_m[i] = As[thread_row * TM + i][d];
             }
+            [unroll]
             for (uint i = 0; i < TN; ++i) {
                 reg_n[i] = Bs[d][thread_col * TN + i];
             }
+            [unroll]
             for (uint m = 0; m < TM; ++m) {
+                [unroll]
                 for (uint n = 0; n < TN; ++n) {
                     thread_results[m * TN + n] += reg_m[m] * reg_n[n];
                 }
@@ -94,11 +99,15 @@ void gemm(
     }
 
     // Write to C tile
+    [unroll]
     for (uint m = 0; m < TM; ++m) {
+        [unroll]
         for (uint n = 0; n < TN; ++n) {
-            uint r = thread_row * TM + m;
-            uint c = thread_col * TN + n;
-            C_tile[r, c] = alpha * thread_results[m*TN+n] + beta * C_tile[r, c];
+            let r = thread_row * TM + m + c_row * BM;
+            let c = thread_col * TN + n + c_col * BN;
+            C[(r * N) + c] = 
+                alpha * thread_results[(m * TN) + n] 
+                + beta * C[(r * N) + c];
         }
     }
 }
